@@ -1,0 +1,51 @@
+# Local specifications
+/Specs/
+
+# Dependencies and generated builds
+node_modules/
+/dist/
+coverage/
+.nyc_output/
+.vite/
+.cache/
+*.tsbuildinfo
+
+# Local secrets (keep safe configuration templates in Git)
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Personal finance data, SQLite sidecars, and local backups
+/data/
+/backups/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.bak
+*.backup
+pocket-transactions*.csv
+
+# Runtime logs and temporary files
+logs/
+*.log
+*.pid
+*.pid.lock
+tmp/
+temp/
+*.tmp
+
+# OS and editor-local files
+.DS_Store
+._*
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
