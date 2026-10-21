@@ -11,6 +11,7 @@
     "build": "vite build",
     "start": "node --env-file-if-exists=.env server/index.js",
     "setup-owner": "node --env-file-if-exists=.env server/setup-owner.js",
+    "setup-owner:neon": "node --env-file=.env.neon server/setup-owner.js --require-postgres",
     "test": "node --test server/*.test.js"
   },
   "dependencies": {
@@ -19,12 +20,14 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.7.1",
     "lucide-react": "^0.468.0",
+    "pg": "^8.23.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.0.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.10",
     "@vitejs/plugin-react": "^4.5.0",
     "concurrently": "^9.1.0",
     "supertest": "^7.1.0",

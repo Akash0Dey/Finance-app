@@ -24,9 +24,9 @@ export async function setOwner(store, username, password) {
   if (typeof username !== 'string' || !/^[a-zA-Z0-9_.@-]{3,100}$/.test(username)) throw new Error('Username must be 3–100 letters, digits, or _.@- characters.');
   if (typeof password !== 'string' || password.length < 6 || password.length > 256) throw new Error('Use a unique password or passphrase between 6 and 256 characters.');
   const passwordHash = await hashPassword(password);
-  store.atomic(() => {
-    store.put('auth', { id: 'owner', username, passwordHash });
-    for (const session of store.all('sessions')) store.delete('sessions', session.id);
+  await store.atomic(async (tx) => {
+    await tx.put('auth', { id: 'owner', username, passwordHash });
+    for (const session of await tx.all('sessions')) await tx.delete('sessions', session.id);
   });
 }
 
@@ -40,49 +40,59 @@ export function installAuth(app, store, { production = false } = {}) {
     const value = entry?.slice(cookieName.length + 1);
     return value && /^[a-f0-9]{64}$/.test(value) ? value : null;
   };
-  const sessionFor = (req) => {
+  const sessionFor = async (req, tx) => {
     const token = cookieToken(req);
     if (!token) return null;
-    const session = store.get('sessions', hashToken(token));
+    const session = await tx.get('sessions', hashToken(token));
     if (!session) return null;
-    if (session.expiresAt <= Date.now()) { store.delete('sessions', session.id); return null; }
+    if (session.expiresAt <= Date.now()) return null;
     return session;
   };
-  app.get('/api/auth/session', (req, res) => {
-    const owner = store.get('auth', 'owner');
-    const session = sessionFor(req);
-    res.json({ configured: Boolean(owner), authenticated: Boolean(owner && session), ...(owner && session ? { username: owner.username } : {}) });
+  app.get('/api/auth/session', async (req, res) => {
+    const result = await store.atomic(async (tx) => {
+      const owner = await tx.get('auth', 'owner');
+      const session = await sessionFor(req, tx);
+      return { configured: Boolean(owner), authenticated: Boolean(owner && session), ...(owner && session ? { username: owner.username } : {}) };
+    });
+    res.json(result);
   });
   const limits = { windowMs: 15 * 60 * 1000, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Please try again in 15 minutes.' } };
   const globalLimit = rateLimit({ ...limits, limit: 50, keyGenerator: () => 'owner-login' });
   const perIpLimit = rateLimit({ ...limits, limit: 10 });
   app.post('/api/auth/login', globalLimit, perIpLimit, async (req, res) => {
     if (production && !req.secure) return res.status(400).json({ error: 'HTTPS is required to sign in.' });
-    const owner = store.get('auth', 'owner');
+    const owner = await store.get('auth', 'owner');
     if (!owner) return res.status(503).json({ error: 'Owner login is not configured. Run npm run setup-owner in the server terminal.' });
     const { username, password } = req.body ?? {};
     if (typeof username !== 'string' || username.length > 100 || typeof password !== 'string' || password.length > 256 || !password.length) return res.status(401).json({ error: 'Invalid username or password.' });
     const valid = await verifyPassword(password, username === owner.username ? owner.passwordHash : await dummyHash);
     if (!valid || username !== owner.username) return res.status(401).json({ error: 'Invalid username or password.' });
-    for (const session of store.all('sessions')) if (session.expiresAt <= Date.now()) store.delete('sessions', session.id);
-    const previous = cookieToken(req);
-    if (previous) store.delete('sessions', hashToken(previous));
-    // Bound the number of persisted sessions; signing in never reuses a supplied token.
-    const sessions = store.all('sessions');
-    for (const session of sessions.slice(0, Math.max(0, sessions.length - 19))) store.delete('sessions', session.id);
     const token = randomBytes(32).toString('hex');
-    store.put('sessions', { id: hashToken(token), expiresAt: Date.now() + sessionDuration });
+    const saved = await store.atomic(async (tx) => {
+      // A password reset during scrypt must not create a session for the old owner.
+      const current = await tx.get('auth', 'owner');
+      if (!current || current.username !== owner.username || current.passwordHash !== owner.passwordHash) return false;
+      for (const session of await tx.all('sessions')) if (session.expiresAt <= Date.now()) await tx.delete('sessions', session.id);
+      const previous = cookieToken(req);
+      if (previous) await tx.delete('sessions', hashToken(previous));
+      const sessions = await tx.all('sessions');
+      for (const session of sessions.slice(0, Math.max(0, sessions.length - 19))) await tx.delete('sessions', session.id);
+      await tx.put('sessions', { id: hashToken(token), expiresAt: Date.now() + sessionDuration });
+      return true;
+    });
+    if (!saved) return res.status(401).json({ error: 'Invalid username or password.' });
     res.cookie(cookieName, token, { ...cookieOptions, maxAge: sessionDuration });
     res.json({ authenticated: true, username: owner.username });
   });
-  app.post('/api/auth/logout', (req, res) => {
+  app.post('/api/auth/logout', async (req, res) => {
     const token = cookieToken(req);
-    if (token) store.delete('sessions', hashToken(token));
+    if (token) await store.atomic((tx) => tx.delete('sessions', hashToken(token)));
     res.clearCookie(cookieName, cookieOptions);
     res.json({ ok: true });
   });
-  app.use('/api', (req, res, next) => {
-    if (!store.get('auth', 'owner') || !sessionFor(req)) return res.status(401).json({ error: 'Please sign in to access your finances.' });
+  app.use('/api', async (req, res, next) => {
+    const authenticated = await store.atomic(async (tx) => Boolean(await tx.get('auth', 'owner') && await sessionFor(req, tx)));
+    if (!authenticated) return res.status(401).json({ error: 'Please sign in to access your finances.' });
     next();
   });
 }

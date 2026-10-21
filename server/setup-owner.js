@@ -1,8 +1,6 @@
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
-import { createStore } from './store.js';
+import { openStore } from './database.js';
 import { setOwner } from './auth.js';
 
 if (!process.stdin.isTTY) {
@@ -14,8 +12,9 @@ const output = new Writable({ write(chunk, encoding, done) { if (!hidden) proces
 const terminal = createInterface({ input: process.stdin, output, terminal: true });
 let store;
 try {
-  const path = process.env.DATABASE_PATH ? resolve(process.env.DATABASE_PATH) : fileURLToPath(new URL('../data/pocket.sqlite', import.meta.url));
-  store = createStore(path);
+  if (process.argv.includes('--require-postgres') && !process.env.DATABASE_URL) throw new Error('Set DATABASE_URL in .env.neon before configuring the Neon owner. Nothing changed.');
+  store = await openStore();
+  console.log(process.env.DATABASE_URL ? 'Target: PostgreSQL (DATABASE_URL). Local SQLite is unchanged.' : 'Target: local SQLite.');
   console.log('Configure the only Pocket owner. Re-running this command replaces the login and signs out all devices.');
   const username = (await terminal.question('Username: ')).trim();
   process.stdout.write('Password / passphrase (6–256 characters; hidden): ');
@@ -36,5 +35,5 @@ try {
   process.exitCode = 1;
 } finally {
   terminal.close();
-  store?.close();
+  await store?.close();
 }

@@ -50,106 +50,111 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
   app.use(express.json({ limit: '100kb' }));
   installAuth(app, store, { production });
   const fail = (message, status = 400) => { const error = new Error(message); error.status = status; throw error; };
-  const allCategories = () => [...new Set([...categories, ...store.all('categories').map((category) => category.name), ...store.all('transactions').map((transaction) => transaction.category)])];
+  const allCategories = async (db) => [...new Set([...categories, ...(await db.all('categories')).map((category) => category.name), ...(await db.all('transactions')).map((transaction) => transaction.category)])];
+  const write = (handler) => async (req, res) => {
+    const { body, status = 200 } = await store.atomic((tx) => handler(req, tx));
+    res.status(status).json(body);
+  };
 
-  app.get('/api/state', (req, res) => {
+  app.get('/api/state', async (req, res) => {
     const selected = month.parse(req.query.month ?? today().slice(0, 7));
-    const data = Object.fromEntries(Object.keys(schemas).map((key) => [key, store.all(key)]));
-    res.json({ ...data, categories: allCategories(), balances: Object.fromEntries(data.accounts.map((a) => [a.id, accountBalance(a, data.transactions)])), categoryBudgetStatus: categoryBudgetStatus(data.categoryBudgets, data.transactions, selected), progress: Object.fromEntries(data.goals.map((g) => [g.id, goalProgress(g, selected)])), totalProgress: Object.fromEntries(data.goals.map((g) => [g.id, goalProgress(g)])), goalNetWorth: Object.fromEntries(data.goals.map((g) => [g.id, goalNetWorth(g)])), goalNetWorthTotal: data.goals.reduce((total, goal) => total + goalNetWorth(goal), 0), insights: insights(data.transactions, selected) });
+    const { data, names } = await store.atomic(async (tx) => ({
+      data: Object.fromEntries(await Promise.all(Object.keys(schemas).map(async (key) => [key, await tx.all(key)]))),
+      names: await allCategories(tx),
+    }));
+    res.json({ ...data, categories: names, balances: Object.fromEntries(data.accounts.map((a) => [a.id, accountBalance(a, data.transactions)])), categoryBudgetStatus: categoryBudgetStatus(data.categoryBudgets, data.transactions, selected), progress: Object.fromEntries(data.goals.map((g) => [g.id, goalProgress(g, selected)])), totalProgress: Object.fromEntries(data.goals.map((g) => [g.id, goalProgress(g)])), goalNetWorth: Object.fromEntries(data.goals.map((g) => [g.id, goalNetWorth(g)])), goalNetWorthTotal: data.goals.reduce((total, goal) => total + goalNetWorth(goal), 0), insights: insights(data.transactions, selected) });
   });
 
-  app.get('/api/export', (req, res) => {
-    const accounts = store.all('accounts');
-    const rows = store.all('transactions').filter((t) => (!req.query.month || t.date.startsWith(String(req.query.month))) && (!req.query.accountId || t.accountId === req.query.accountId) && (!req.query.category || t.category === req.query.category) && (!req.query.search || `${t.notes} ${t.category}`.toLowerCase().includes(String(req.query.search).toLowerCase())));
+  app.get('/api/export', async (req, res) => {
+    const [accounts, transactions] = await store.atomic(async (tx) => [await tx.all('accounts'), await tx.all('transactions')]);
+    const rows = transactions.filter((t) => (!req.query.month || t.date.startsWith(String(req.query.month))) && (!req.query.accountId || t.accountId === req.query.accountId) && (!req.query.category || t.category === req.query.category) && (!req.query.search || `${t.notes} ${t.category}`.toLowerCase().includes(String(req.query.search).toLowerCase())));
     res.type('text/csv').attachment('pocket-transactions.csv').send(csv([['Date', 'Type', 'Amount', 'Category', 'Account', 'Notes'], ...rows.map((t) => [t.date, t.type, t.amount, t.category, accounts.find((a) => a.id === t.accountId)?.name, t.notes])]));
   });
 
-  app.post('/api/smart-entry', (req, res) => {
+  app.post('/api/smart-entry', async (req, res) => {
     const { input } = z.object({ input: z.string().trim().min(1).max(500) }).parse(req.body);
     const number = input.match(/(?:₹|\$|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
-    const account = store.all('accounts').find((a) => input.toLowerCase().includes(a.name.toLowerCase()));
+    const account = (await store.all('accounts')).find((a) => input.toLowerCase().includes(a.name.toLowerCase()));
     const explicitDate = input.match(/\b20\d{2}-\d{2}-\d{2}\b/);
     const category = suggestCategory(input);
     res.json({ type: /salary|received|income|paycheck/i.test(input) ? 'income' : 'expense', amount: number ? Number(number[1].replaceAll(',', '')) : '', category, accountId: account?.id ?? '', date: explicitDate && date.safeParse(explicitDate[0]).success ? explicitDate[0] : today(), notes: input });
   });
 
-  app.post('/api/goals/:id/contributions', (req, res) => {
-    const goal = store.get('goals', req.params.id) ?? fail('Goal not found', 404);
+  app.post('/api/goals/:id/contributions', write(async (req, tx) => {
+    const goal = await tx.get('goals', req.params.id) ?? fail('Goal not found', 404);
     if (goal.status !== 'active') fail('Only active goals accept contributions');
     const contribution = z.object({ amount: signedProgress, date }).parse(req.body);
-    res.json(store.put('goals', { ...goal, contributions: [...(goal.contributions ?? []), { ...contribution, id: randomUUID() }] }));
-  });
+    return { body: await tx.put('goals', { ...goal, contributions: [...(goal.contributions ?? []), { ...contribution, id: randomUUID() }] }) };
+  }));
 
-  app.post('/api/categoryBudgets/:id/adjustments', (req, res) => {
-    const budget = store.get('categoryBudgets', req.params.id) ?? fail('Budget not found', 404);
+  app.post('/api/categoryBudgets/:id/adjustments', write(async (req, tx) => {
+    const budget = await tx.get('categoryBudgets', req.params.id) ?? fail('Budget not found', 404);
     const adjustment = z.object({ amount: signedProgress, month, note: z.string().trim().max(240).default('') }).parse(req.body);
     if (adjustment.month < budget.month) fail('An adjustment cannot be dated before the budget starts');
-    res.status(201).json(store.put('categoryBudgets', { ...budget, adjustments: [...(budget.adjustments ?? []), { ...adjustment, id: randomUUID() }] }));
-  });
+    return { status: 201, body: await tx.put('categoryBudgets', { ...budget, adjustments: [...(budget.adjustments ?? []), { ...adjustment, id: randomUUID() }] }) };
+  }));
 
-  app.post('/api/demo', (req, res) => {
+  app.post('/api/demo', write(async (req, tx) => {
     if (production) fail('Demo data is unavailable in production', 404);
-    if (Object.keys(schemas).some((key) => store.all(key).length)) fail('Demo data can only be loaded into an empty app');
-    store.atomic(() => {
+    for (const key of Object.keys(schemas)) if ((await tx.all(key)).length) fail('Demo data can only be loaded into an empty app');
       const current = today().slice(0, 7);
-      const account = store.put('accounts', { id: randomUUID(), name: 'HDFC Bank', type: 'bank', openingBalance: 85000 });
-      const savings = store.put('accounts', { id: randomUUID(), name: 'Savings account', type: 'savings', openingBalance: 140000 });
+      const account = await tx.put('accounts', { id: randomUUID(), name: 'HDFC Bank', type: 'bank', openingBalance: 85000 });
+      await tx.put('accounts', { id: randomUUID(), name: 'Savings account', type: 'savings', openingBalance: 140000 });
       for (const [day, value, category, notes, type] of [[1, 95000, 'Salary', 'October salary', 'income'], [2, 18000, 'Rent', 'A place to call home', 'expense'], [4, 2400, 'Food', 'Weekly groceries', 'expense'], [6, 850, 'Transport', 'Fuel & a weekend drive', 'expense'], [8, 1499, 'Utilities', 'Internet subscription', 'expense'], [10, 1800, 'Food', 'Dinner with friends', 'expense'], [12, 3200, 'Shopping', 'A little something for home', 'expense'], [14, 599, 'Entertainment', 'Netflix subscription', 'expense'], [16, 1250, 'Food', 'Groceries & coffee', 'expense']]) {
-        store.put('transactions', { id: randomUUID(), date: `${current}-${String(day).padStart(2, '0')}`, type, amount: value, category, notes: notes.replace('October', new Date().toLocaleString('en', { month: 'long' })), accountId: account.id });
+        await tx.put('transactions', { id: randomUUID(), date: `${current}-${String(day).padStart(2, '0')}`, type, amount: value, category, notes: notes.replace('October', new Date().toLocaleString('en', { month: 'long' })), accountId: account.id });
       }
-      for (const [name, targetAmount, saved, purpose] of [['Emergency fund', 300000, 126000, 'savings'], ['Japan, here I come', 180000, 72000, 'savings'], ['Student loan', 200000, 45000, 'debt']]) store.put('goals', { id: randomUUID(), name, type: 'unlimited', purpose, targetAmount, deadline: null, status: 'active', contributions: [{ id: randomUUID(), amount: saved, date: today() }] });
-      store.put('investments', { id: randomUUID(), name: 'Index fund portfolio', type: 'asset', value: 275000, cost: 240000, date: today(), notes: 'Long-term investing', history: [{ date: today(), value: 275000 }] });
-      void savings;
-    });
-    res.status(201).json({ ok: true });
-  });
+      for (const [name, targetAmount, saved, purpose] of [['Emergency fund', 300000, 126000, 'savings'], ['Japan, here I come', 180000, 72000, 'savings'], ['Student loan', 200000, 45000, 'debt']]) await tx.put('goals', { id: randomUUID(), name, type: 'unlimited', purpose, targetAmount, deadline: null, status: 'active', contributions: [{ id: randomUUID(), amount: saved, date: today() }] });
+      await tx.put('investments', { id: randomUUID(), name: 'Index fund portfolio', type: 'asset', value: 275000, cost: 240000, date: today(), notes: 'Long-term investing', history: [{ date: today(), value: 275000 }] });
+    return { status: 201, body: { ok: true } };
+  }));
 
   for (const [collection, schema] of Object.entries(schemas)) {
     if (collection === 'categories') continue;
-    const save = (req, res) => {
-      const old = req.params.id ? store.get(collection, req.params.id) : null;
+    const save = write(async (req, tx) => {
+      const old = req.params.id ? await tx.get(collection, req.params.id) : null;
       if (req.params.id && !old) fail('Record not found', 404);
       const body = schema.parse(req.body);
-      if (collection === 'transactions' && !store.get('accounts', body.accountId)) fail('Choose an existing account');
+      if (collection === 'transactions' && !await tx.get('accounts', body.accountId)) fail('Choose an existing account');
       if (collection === 'categoryBudgets') {
-        const unknown = body.categories.find((name) => name !== 'All' && !allCategories().some((category) => category.toLowerCase() === name.toLowerCase()));
+        const names = await allCategories(tx);
+        const unknown = body.categories.find((name) => name !== 'All' && !names.some((category) => category.toLowerCase() === name.toLowerCase()));
         if (unknown) fail(`Create the category “${unknown}” before using it in a budget`);
-        if (store.all('categoryBudgets').some((budget) => budget.id !== old?.id && budget.name.toLowerCase() === body.name.toLowerCase())) fail('A category budget with this name already exists');
+        if ((await tx.all('categoryBudgets')).some((budget) => budget.id !== old?.id && budget.name.toLowerCase() === body.name.toLowerCase())) fail('A category budget with this name already exists');
       }
       const value = { ...body, id: old?.id ?? randomUUID() };
       if (collection === 'goals') value.contributions = old?.contributions ?? [];
       if (collection === 'categoryBudgets') value.adjustments = old?.adjustments ?? [];
       if (collection === 'investments') value.startDate = body.startDate ?? old?.startDate ?? body.date;
       if (collection === 'investments') value.history = [...(old?.history ?? []), ...(old?.value !== body.value ? [{ date: body.date, value: body.value }] : [])];
-      res.status(old ? 200 : 201).json(store.put(collection, value));
-    };
+      return { status: old ? 200 : 201, body: await tx.put(collection, value) };
+    });
     app.post(`/api/${collection}`, save);
     app.put(`/api/${collection}/:id`, save);
-    app.delete(`/api/${collection}/:id`, (req, res) => {
-      if (!store.get(collection, req.params.id)) fail('Record not found', 404);
-      if (collection === 'accounts' && store.all('transactions').some((t) => t.accountId === req.params.id)) fail('Delete or reassign this account’s transactions first');
-      store.delete(collection, req.params.id);
-      res.json({ ok: true });
-    });
+    app.delete(`/api/${collection}/:id`, write(async (req, tx) => {
+      if (!await tx.get(collection, req.params.id)) fail('Record not found', 404);
+      if (collection === 'accounts' && (await tx.all('transactions')).some((t) => t.accountId === req.params.id)) fail('Delete or reassign this account’s transactions first');
+      await tx.delete(collection, req.params.id);
+      return { body: { ok: true } };
+    }));
   }
-  app.post('/api/categories', (req, res) => {
+  app.post('/api/categories', write(async (req, tx) => {
     const { name } = schemas.categories.parse(req.body);
     if (name.toLowerCase() === 'all') fail('“All” is reserved for budgets');
-    if (allCategories().some((category) => category.toLowerCase() === name.toLowerCase())) fail('That category already exists');
-    res.status(201).json(store.put('categories', { id: randomUUID(), name }));
-  });
-  app.delete('/api/categories/:id', (req, res) => {
-    const category = store.get('categories', req.params.id) ?? fail('Category not found', 404);
-    if (store.all('transactions').some((transaction) => transaction.category.toLowerCase() === category.name.toLowerCase())) fail('This category is used by transactions and cannot be deleted');
-    if (store.all('categoryBudgets').some((budget) => budget.categories.some((name) => name.toLowerCase() === category.name.toLowerCase()))) fail('Remove this category from its budget before deleting it');
-    store.delete('categories', category.id);
-    res.json({ ok: true });
-  });
+    if ((await allCategories(tx)).some((category) => category.toLowerCase() === name.toLowerCase())) fail('That category already exists');
+    return { status: 201, body: await tx.put('categories', { id: randomUUID(), name }) };
+  }));
+  app.delete('/api/categories/:id', write(async (req, tx) => {
+    const category = await tx.get('categories', req.params.id) ?? fail('Category not found', 404);
+    if ((await tx.all('transactions')).some((transaction) => transaction.category.toLowerCase() === category.name.toLowerCase())) fail('This category is used by transactions and cannot be deleted');
+    if ((await tx.all('categoryBudgets')).some((budget) => budget.categories.some((name) => name.toLowerCase() === category.name.toLowerCase()))) fail('Remove this category from its budget before deleting it');
+    await tx.delete('categories', category.id);
+    return { body: { ok: true } };
+  }));
   app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found' }));
   app.use((error, req, res, next) => {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues.map((i) => `${i.path.join('.') || 'Input'}: ${i.message}`).join('; ') });
     const status = error.status ?? 500;
-    if (status === 500) console.error(error);
+    if (status === 500) console.error('API request failed. Check database connectivity and server configuration.');
     res.status(status).json({ error: status === 500 ? 'An unexpected error occurred' : error.message });
   });
   return app;
