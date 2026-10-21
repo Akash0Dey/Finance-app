@@ -135,6 +135,27 @@ test('PostgreSQL: all transfer directions update balances, holdings and export a
   assert.equal(state.investments[0].value, 50);
   assert.equal(state.balances[second.id], 339);
   assert.equal(state.transactions.length, 4);
+  const latest = state.transactions.at(-1);
+  const { body: edited } = await api.put(`/api/transactions/${latest.id}`).send({ ...latest, amount: 50, receivedAmount: 48 }).expect(200);
+  assert.equal(edited.id, latest.id);
+  state = (await api.get('/api/state').expect(200)).body;
+  assert.equal(state.investments[0].value, 100);
+  assert.equal(state.investments[0].cost, 66.67);
+  assert.equal(state.balances[second.id], 288);
+  assert.equal(state.transactions.length, 4);
+  const before = state;
+  await api.put(`/api/transactions/${latest.id}`).send({ ...edited, amount: 1000 }).expect(400);
+  assert.deepEqual((await api.get('/api/state').expect(200)).body, before);
+  // Delete newest-first, including an edited withdrawal, restoring the baseline.
+  for (const record of [...state.transactions].reverse()) {
+    await api.delete(`/api/transactions/${record.id}`).send({}).expect(200);
+  }
+  state = (await api.get('/api/state').expect(200)).body;
+  assert.deepEqual(state.transactions, []);
+  assert.equal(state.balances[first.id], 1000);
+  assert.equal(state.balances[second.id], 0);
+  assert.equal(state.investments[0].value, 200);
+  assert.equal(state.investments[0].cost, 100);
 });
 
 test('PostgreSQL: failed commit rolls back, preserves errors and releases connections', async () => {

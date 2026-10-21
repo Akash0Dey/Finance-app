@@ -61,6 +61,29 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
     const { body, status = 200 } = await store.atomic((tx) => handler(req, tx));
     res.status(status).json(body);
   };
+  const reverseTransfer = async (tx, record, action) => {
+    const holdingId = record.fromType === 'investment' ? record.fromId : record.toType === 'investment' ? record.toId : null;
+    if (!holdingId) return;
+    const holding = await tx.get('investments', holdingId);
+    if (!holding) fail('The original investment no longer exists');
+    let latest;
+    for (const entry of [...(holding.history ?? [])].reverse()) {
+      if (entry.action) continue;
+      if (entry.transferId) {
+        const active = await tx.get('transactions', entry.transferId);
+        if (!active || !(active.fromType === 'investment' && active.fromId === holdingId || active.toType === 'investment' && active.toId === holdingId)) continue;
+      }
+      latest = entry;
+      break;
+    }
+    const current = holding.history?.at(-1);
+    if (latest?.transferId !== record.id || cents(current?.value) !== cents(holding.value) || cents(current?.cost) !== cents(holding.cost)) fail('This investment has later activity. Remove or correct its most recent activity first.');
+    const withdrawing = record.fromType === 'investment';
+    const value = money(cents(holding.value) + (withdrawing ? 1 : -1) * cents(record.amount));
+    const cost = money(cents(holding.cost) + (withdrawing ? cents(record.costBasisRemoved) : -cents(record.amount)));
+    if (![value, cost].every((n) => Number.isFinite(n) && n >= 0 && n <= 1_000_000_000)) fail('Cannot safely reverse this transfer with the current investment value and cost');
+    await tx.put('investments', { ...holding, value, cost, date: today(), history: [...holding.history, { date: today(), value, cost, transferId: record.id, action }] });
+  };
 
   app.get('/api/state', async (req, res) => {
     const selected = month.parse(req.query.month ?? today().slice(0, 7));
@@ -119,12 +142,20 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
     const save = write(async (req, tx) => {
       const old = req.params.id ? await tx.get(collection, req.params.id) : null;
       if (req.params.id && !old) fail('Record not found', 404);
-      if (collection === 'transactions' && old?.type === 'transfer') fail('Transfers are read-only. Record a separate correcting transfer instead.');
+      if (collection === 'transactions' && old?.type === 'transfer' && req.body.type !== 'transfer') fail('A transfer must remain a transfer');
       if (collection === 'transactions' && req.body.type === 'transfer') {
-        if (old) fail('Create a new transfer instead of converting an existing transaction');
+        if (old && old.type !== 'transfer') fail('Create a new transfer instead of converting an existing transaction');
         const transfer = transferSchema.parse(req.body);
         if (transfer.fromType === transfer.toType && transfer.fromId === transfer.toId) fail('Choose different source and destination');
         if (transfer.fromType === 'investment' && transfer.toType !== 'account') fail('Investment transfers must go to an account');
+        if (transfer.fromType === 'account' && transfer.receivedAmount !== undefined && cents(transfer.receivedAmount) !== cents(transfer.amount)) fail('Account transfers must send and receive the same amount');
+        const receivedAmount = transfer.fromType === 'account' ? transfer.amount : transfer.receivedAmount;
+        const sameMovement = old && ['fromType', 'fromId', 'toType', 'toId', 'amount'].every((key) => transfer[key] === old[key]) && receivedAmount === old.receivedAmount;
+        if (sameMovement) {
+          // Metadata-only edits must not recalculate an earlier withdrawal's basis.
+          return { body: await tx.put('transactions', { ...old, date: transfer.date, notes: transfer.notes }) };
+        }
+        if (old) await reverseTransfer(tx, old, 'edit-reversal');
         const source = await tx.get(transfer.fromType === 'account' ? 'accounts' : 'investments', transfer.fromId);
         const destination = await tx.get(transfer.toType === 'account' ? 'accounts' : 'investments', transfer.toId);
         if (!source || !destination) fail('Choose an existing source and destination');
@@ -132,7 +163,7 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
         if (holding && holding.type !== 'asset') fail('Only investment assets support transfers');
         if (transfer.fromType === 'investment' && transfer.receivedAmount === undefined) fail('Enter the amount received in the bank');
         if (transfer.fromType === 'account' && transfer.receivedAmount !== undefined && cents(transfer.receivedAmount) !== cents(transfer.amount)) fail('Account transfers must send and receive the same amount');
-        const record = { ...transfer, id: randomUUID(), receivedAmount: transfer.fromType === 'account' ? transfer.amount : transfer.receivedAmount, category: 'Transfer', fromName: source.name, toName: destination.name };
+        const record = { ...transfer, id: old?.id ?? randomUUID(), receivedAmount: transfer.fromType === 'account' ? transfer.amount : transfer.receivedAmount, category: 'Transfer', fromName: source.name, toName: destination.name };
         if (holding) {
           const withdrawing = transfer.fromType === 'investment';
           if (withdrawing && cents(transfer.amount) > cents(holding.value)) fail('Deducted amount exceeds the investment value');
@@ -144,7 +175,7 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
           record.costBasisRemoved = money(removed);
           await tx.put('investments', { ...holding, value, cost, date: transfer.date, history: [...(holding.history ?? []), { date: transfer.date, value, cost, transferId: record.id }] });
         }
-        return { status: 201, body: await tx.put('transactions', record) };
+        return { status: old ? 200 : 201, body: await tx.put('transactions', record) };
       }
       const body = schema.parse(req.body);
       if (collection === 'investments' && old?.type !== body.type && (await tx.all('transactions')).some((t) => t.type === 'transfer' && (t.fromType === 'investment' && t.fromId === old?.id || t.toType === 'investment' && t.toId === old?.id))) fail('An investment with transfer history must remain an asset');
@@ -167,7 +198,7 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
     app.delete(`/api/${collection}/:id`, write(async (req, tx) => {
       const record = await tx.get(collection, req.params.id);
       if (!record) fail('Record not found', 404);
-      if (collection === 'transactions' && record.type === 'transfer') fail('Transfers are read-only. Record a separate correcting transfer instead.');
+      if (collection === 'transactions' && record.type === 'transfer') await reverseTransfer(tx, record, 'delete-reversal');
       const linkedType = collection === 'accounts' ? 'account' : collection === 'investments' ? 'investment' : null;
       if (linkedType && (await tx.all('transactions')).some((t) => t.type === 'transfer' && (t.fromType === linkedType && t.fromId === record.id || t.toType === linkedType && t.toId === record.id))) fail('This record has transfer history and cannot be deleted');
       if (collection === 'accounts' && (await tx.all('transactions')).some((t) => t.accountId === req.params.id)) fail('Delete or reassign this account’s transactions first');

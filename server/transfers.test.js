@@ -9,6 +9,144 @@ const testSalt = 'transfer-tests-only';
 const testHash = `scrypt:${testSalt}:${scryptSync('test-only-passphrase', testSalt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }).toString('hex')}`;
 const date = '2026-10-15';
 
+test('deleting account transfers restores balances and removes them from CSV', async (t) => {
+  const { api } = fixture(t);
+  const bank = await account(api);
+  const cash = await account(api, { name: 'Cash', openingBalance: 0 });
+  const before = await state(api);
+  const { body: record } = await api.post('/api/transactions').send(transfer(bank, cash)).expect(201);
+  await api.delete(`/api/transactions/${record.id}`).send({}).expect(200);
+  assert.deepEqual(await state(api), before);
+  assert.deepEqual(await exportRows(api, { type: 'transfer' }), []);
+  await api.delete(`/api/transactions/${record.id}`).send({}).expect(404);
+  await api.delete(`/api/accounts/${cash.id}`).send({}).expect(200);
+});
+
+test('deleting investment transfers restores original value and exact cost newest-first', async (t) => {
+  const { api } = fixture(t);
+  const bank = await account(api);
+  const holding = await investment(api, { value: 3, cost: 1 });
+  const { body: deposit } = await api.post('/api/transactions').send(transfer(bank, holding, { amount: 1 })).expect(201);
+  const { body: withdrawal } = await api.post('/api/transactions').send(transfer(holding, bank, { amount: 1, receivedAmount: 0.75 })).expect(201);
+  await rejectedWithoutChanges(api, () => api.delete(`/api/transactions/${deposit.id}`).send({}), /later activity/);
+  await api.delete(`/api/transactions/${withdrawal.id}`).send({}).expect(200);
+  let after = await state(api);
+  assert.equal(after.balances[bank.id], 999);
+  assert.equal(after.investments[0].value, 4);
+  assert.equal(after.investments[0].cost, 2);
+  assert.equal(after.investments[0].history.at(-1).action, 'delete-reversal');
+  await api.delete(`/api/transactions/${deposit.id}`).send({}).expect(200);
+  after = await state(api);
+  assert.equal(after.balances[bank.id], 1000);
+  assert.equal(after.investments[0].value, 3);
+  assert.equal(after.investments[0].cost, 1);
+  assert.deepEqual(after.transactions, []);
+  await api.delete(`/api/investments/${holding.id}`).send({}).expect(200);
+});
+
+test('failed transfer deletion rolls back holding reversal and history', async (t) => {
+  const { api, store } = fixture(t);
+  const bank = await account(api);
+  const holding = await investment(api);
+  const { body: record } = await api.post('/api/transactions').send(transfer(holding, bank, { receivedAmount: 90 })).expect(201);
+  const before = await state(api);
+  const originalDelete = store.delete;
+  store.delete = (collection, id) => {
+    if (collection === 'transactions') { const error = new Error('Delete failed'); error.status = 409; throw error; }
+    return originalDelete(collection, id);
+  };
+  try { await api.delete(`/api/transactions/${record.id}`).send({}).expect(409); }
+  finally { store.delete = originalDelete; }
+  assert.deepEqual(await state(api), before);
+  await api.delete(`/api/transactions/${record.id}`).send({}).expect(200);
+  const after = await state(api);
+  assert.equal(after.investments[0].value, holding.value);
+  assert.equal(after.investments[0].cost, holding.cost);
+  assert.equal(after.balances[bank.id], bank.openingBalance);
+});
+
+test('account transfer edits replace the original movement and preserve its ID', async (t) => {
+  const { api } = fixture(t);
+  const bank = await account(api);
+  const cash = await account(api, { name: 'Cash', openingBalance: 0 });
+  const savings = await account(api, { name: 'Savings', openingBalance: 0 });
+  const { body: old } = await api.post('/api/transactions').send(transfer(bank, cash)).expect(201);
+  const { body: edited } = await api.put(`/api/transactions/${old.id}`).send(transfer(bank, savings, { amount: 250, date: '2026-09-01', notes: 'Corrected' })).expect(200);
+  assert.equal(edited.id, old.id);
+  const after = await state(api);
+  assert.equal(after.transactions.length, 1);
+  assert.equal(after.balances[bank.id], 750);
+  assert.equal(after.balances[cash.id], 0);
+  assert.equal(after.balances[savings.id], 250);
+  assert.equal(edited.date, '2026-09-01');
+  await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${old.id}`).send({ ...edited, receivedAmount: 1 }), /same amount/);
+});
+
+test('investment transfer edits reverse original cost exactly and can change direction or holding', async (t) => {
+  const { api } = fixture(t);
+  const bank = await account(api);
+  const holding = await investment(api, { value: 300, cost: 200 });
+  const other = await investment(api, { name: 'Other', value: 50, cost: 40 });
+  const { body: old } = await api.post('/api/transactions').send(transfer(holding, bank, { amount: 100, receivedAmount: 90 })).expect(201);
+  let edited = (await api.put(`/api/transactions/${old.id}`).send({ ...old, amount: 150, receivedAmount: 145 }).expect(200)).body;
+  let after = await state(api);
+  assert.equal(after.balances[bank.id], 1145);
+  assert.equal(after.investments[0].value, 150);
+  assert.equal(after.investments[0].cost, 100);
+  assert.equal(edited.costBasisRemoved, 100);
+  const history = after.investments[0].history;
+  await api.put(`/api/transactions/${old.id}`).send(edited).expect(200);
+  assert.deepEqual((await state(api)).investments[0].history, history);
+  edited = (await api.put(`/api/transactions/${old.id}`).send(transfer(bank, other, { amount: 25 })).expect(200)).body;
+  after = await state(api);
+  assert.equal(after.investments[0].value, 300);
+  assert.equal(after.investments[0].cost, 200);
+  assert.equal(after.investments[1].value, 75);
+  assert.equal(after.investments[1].cost, 65);
+  assert.equal(after.balances[bank.id], 975);
+  assert.equal(after.transactions.length, 1);
+  assert.equal(edited.id, old.id);
+  await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${old.id}`).send(transfer(other, bank, { amount: 1000, receivedAmount: 1 })), /exceeds/);
+});
+
+test('older investment transfers allow metadata edits but reject dependent financial edits', async (t) => {
+  const { api } = fixture(t);
+  const bank = await account(api);
+  const holding = await investment(api);
+  const { body: old } = await api.post('/api/transactions').send(transfer(bank, holding)).expect(201);
+  await api.post('/api/transactions').send(transfer(holding, bank, { amount: 20, receivedAmount: 19 })).expect(201);
+  await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${old.id}`).send({ ...old, amount: 50, receivedAmount: 50 }), /later activity/);
+  const before = await state(api);
+  await api.put(`/api/transactions/${old.id}`).send({ ...old, notes: 'Updated note', date: '2026-09-03' }).expect(200);
+  const after = await state(api);
+  assert.deepEqual(after.investments, before.investments);
+  assert.deepEqual(after.balances, before.balances);
+  assert.equal(after.transactions[0].notes, 'Updated note');
+});
+
+test('editing a deposit to another amount reverses once and rolls back on persistence failure', async (t) => {
+  const { api, store } = fixture(t);
+  const bank = await account(api);
+  const holding = await investment(api);
+  const { body: old } = await api.post('/api/transactions').send(transfer(bank, holding)).expect(201);
+  await api.put(`/api/transactions/${old.id}`).send({ ...old, amount: 50, receivedAmount: 50 }).expect(200);
+  let after = await state(api);
+  assert.equal(after.balances[bank.id], 950);
+  assert.equal(after.investments[0].value, 350);
+  assert.equal(after.investments[0].cost, 250);
+  const originalPut = store.put;
+  store.put = (collection, value) => {
+    if (collection === 'transactions') { const error = new Error('Edit write failed'); error.status = 409; throw error; }
+    return originalPut(collection, value);
+  };
+  try { await api.put(`/api/transactions/${old.id}`).send({ ...old, amount: 75, receivedAmount: 75 }).expect(409); }
+  finally { store.put = originalPut; }
+  assert.deepEqual(await state(api), after);
+  const current = after.investments[0];
+  await api.put(`/api/investments/${holding.id}`).send({ ...current, cost: 20 }).expect(200);
+  await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${old.id}`).send({ ...old, amount: 75, receivedAmount: 75 }), /later activity/);
+});
+
 function fixture(t) {
   const store = createStore(':memory:');
   t.after(() => store.close());
@@ -305,7 +443,7 @@ test('deposits exceeding supported investment value or cost fail atomically', as
   }
 });
 
-test('transfer records are immutable and linked accounts and assets cannot be deleted or converted to liabilities', async (t) => {
+test('transfer type is protected and linked records cannot be deleted or converted to liabilities', async (t) => {
   const { api } = fixture(t);
   const bank = await account(api);
   const savings = await account(api, { name: 'Savings' });
@@ -315,9 +453,7 @@ test('transfer records are immutable and linked accounts and assets cannot be de
     records.push((await api.post('/api/transactions').send(payload).expect(201)).body);
   }
   for (const record of records) {
-    await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${record.id}`).send({ ...record, amount: 1 }), /read-only/);
-    await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${record.id}`).send({ type: 'expense', accountId: bank.id, date, amount: 1, category: 'Food' }), /read-only/);
-    await rejectedWithoutChanges(api, () => api.delete(`/api/transactions/${record.id}`).send({}), /read-only/);
+    await rejectedWithoutChanges(api, () => api.put(`/api/transactions/${record.id}`).send({ type: 'expense', accountId: bank.id, date, amount: 1, category: 'Food' }), /must remain a transfer/);
   }
   for (const endpoint of [`accounts/${bank.id}`, `accounts/${savings.id}`, `investments/${holding.id}`]) {
     await rejectedWithoutChanges(api, () => api.delete(`/api/${endpoint}`).send({}), /transfer history.*cannot be deleted/);
