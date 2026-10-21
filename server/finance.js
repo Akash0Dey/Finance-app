@@ -44,7 +44,12 @@ export function categoryBudgetStatus(budgets, transactions, month) {
 }
 
 export function accountBalance(account, transactions) {
-  return money(cents(account.openingBalance) + transactions.filter((t) => t.accountId === account.id).reduce((sum, t) => sum + (t.type === 'income' ? 1 : -1) * cents(t.amount), 0));
+  return money(cents(account.openingBalance) + transactions.reduce((sum, t) => {
+    if (t.type === 'transfer') return sum
+      - (t.fromType === 'account' && t.fromId === account.id ? cents(t.amount) : 0)
+      + (t.toType === 'account' && t.toId === account.id ? cents(t.receivedAmount) : 0);
+    return sum + (t.accountId === account.id ? (t.type === 'income' ? 1 : -1) * cents(t.amount) : 0);
+  }, 0));
 }
 
 export function goalProgress(goal, month) {

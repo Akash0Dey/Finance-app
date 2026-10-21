@@ -108,6 +108,35 @@ test('database selection rejects invalid URLs and unsafe production storage', as
   await store.close();
 });
 
+test('PostgreSQL: all transfer directions update balances, holdings and export atomically', async (t) => {
+  const store = await postgresFixture(t);
+  await setOwner(store, 'transfer-owner', 'public-transfer-passphrase');
+  const api = request.agent(createApp(store));
+  await api.post('/api/auth/login').send({ username: 'transfer-owner', password: 'public-transfer-passphrase' }).expect(200);
+  const { body: first } = await api.post('/api/accounts').send({ name: 'Bank A', type: 'bank', openingBalance: 1000 }).expect(201);
+  const { body: second } = await api.post('/api/accounts').send({ name: 'Bank B', type: 'bank', openingBalance: 0 }).expect(201);
+  const { body: holding } = await api.post('/api/investments').send({ name: 'Fund', type: 'asset', value: 200, cost: 100, date: '2026-10-01' }).expect(201);
+  const base = { type: 'transfer', date: '2026-10-02', fromType: 'account', fromId: first.id, toType: 'account', toId: second.id, amount: 100 };
+  await api.post('/api/transactions').send(base).expect(201);
+  await api.post('/api/transactions').send({ ...base, toType: 'investment', toId: holding.id }).expect(201);
+  const { body: withdrawal } = await api.post('/api/transactions').send({ ...base, fromType: 'investment', fromId: holding.id, toId: second.id, amount: 150, receivedAmount: 140 }).expect(201);
+  let state = (await api.get('/api/state?month=2026-10').expect(200)).body;
+  assert.equal(state.balances[first.id], 800);
+  assert.equal(state.balances[second.id], 240);
+  assert.equal(state.investments[0].value, 150);
+  assert.equal(state.investments[0].cost, 100);
+  assert.equal(withdrawal.costBasisRemoved, 100);
+  assert.equal(state.transactions.length, 3);
+  assert.match((await api.get(`/api/export?type=transfer&investmentId=${holding.id}`).expect(200)).text, /Received amount/);
+  // Competing withdrawals are serialized; one must fail without a partial credit.
+  const results = await Promise.all([1, 2].map(() => api.post('/api/transactions').send({ ...base, fromType: 'investment', fromId: holding.id, toId: second.id, amount: 100, receivedAmount: 99 })));
+  assert.deepEqual(results.map((r) => r.status).sort(), [201, 400]);
+  state = (await api.get('/api/state').expect(200)).body;
+  assert.equal(state.investments[0].value, 50);
+  assert.equal(state.balances[second.id], 339);
+  assert.equal(state.transactions.length, 4);
+});
+
 test('PostgreSQL: failed commit rolls back, preserves errors and releases connections', async () => {
   const original = new Error('Commit failed');
   const rollbackError = new Error('Connection lost');

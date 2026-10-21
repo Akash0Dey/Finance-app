@@ -1,7 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { accountBalance, categories, categoryBudgetStatus, csv, goalNetWorth, goalProgress, insights, suggestCategory } from './finance.js';
+import { accountBalance, categories, categoryBudgetStatus, cents, money, csv, goalNetWorth, goalProgress, insights, suggestCategory } from './finance.js';
 import { installAuth } from './auth.js';
 
 const text = z.string().trim().min(1).max(120);
@@ -19,6 +19,12 @@ const schemas = {
   investments: z.object({ name: text, type: z.enum(['asset', 'liability']), value: signedAmount.refine((v) => v >= 0, 'Value cannot be negative'), cost: signedAmount.refine((v) => v >= 0, 'Cost cannot be negative'), startDate: date.optional(), date, notes: z.string().trim().max(1000).default('') }),
 };
 const today = () => new Date().toLocaleDateString('en-CA');
+const transferSchema = z.object({
+  type: z.literal('transfer'), date, amount, receivedAmount: signedAmount.refine((n) => n >= 0, 'Received amount cannot be negative').optional(),
+  fromType: z.enum(['account', 'investment']), fromId: text,
+  toType: z.enum(['account', 'investment']), toId: text,
+  notes: z.string().trim().max(1000).default(''),
+});
 
 export function createApp(store, { production = false, publicOrigin, trustProxy = false } = {}) {
   if (production && (!publicOrigin || new URL(publicOrigin).protocol !== 'https:' || new URL(publicOrigin).origin !== publicOrigin)) throw new Error('Production requires PUBLIC_ORIGIN as an exact HTTPS origin, without a trailing slash.');
@@ -50,7 +56,7 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
   app.use(express.json({ limit: '100kb' }));
   installAuth(app, store, { production });
   const fail = (message, status = 400) => { const error = new Error(message); error.status = status; throw error; };
-  const allCategories = async (db) => [...new Set([...categories, ...(await db.all('categories')).map((category) => category.name), ...(await db.all('transactions')).map((transaction) => transaction.category)])];
+  const allCategories = async (db) => [...new Set([...categories, ...(await db.all('categories')).map((category) => category.name), ...(await db.all('transactions')).filter((t) => t.type !== 'transfer').map((transaction) => transaction.category)])];
   const write = (handler) => async (req, res) => {
     const { body, status = 200 } = await store.atomic((tx) => handler(req, tx));
     res.status(status).json(body);
@@ -67,8 +73,8 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
 
   app.get('/api/export', async (req, res) => {
     const [accounts, transactions] = await store.atomic(async (tx) => [await tx.all('accounts'), await tx.all('transactions')]);
-    const rows = transactions.filter((t) => (!req.query.month || t.date.startsWith(String(req.query.month))) && (!req.query.accountId || t.accountId === req.query.accountId) && (!req.query.category || t.category === req.query.category) && (!req.query.search || `${t.notes} ${t.category}`.toLowerCase().includes(String(req.query.search).toLowerCase())));
-    res.type('text/csv').attachment('pocket-transactions.csv').send(csv([['Date', 'Type', 'Amount', 'Category', 'Account', 'Notes'], ...rows.map((t) => [t.date, t.type, t.amount, t.category, accounts.find((a) => a.id === t.accountId)?.name, t.notes])]));
+    const rows = transactions.filter((t) => (!req.query.month || t.date.startsWith(String(req.query.month))) && (!req.query.type || t.type === req.query.type) && (!req.query.accountId || t.accountId === req.query.accountId || t.fromType === 'account' && t.fromId === req.query.accountId || t.toType === 'account' && t.toId === req.query.accountId) && (!req.query.investmentId || t.fromType === 'investment' && t.fromId === req.query.investmentId || t.toType === 'investment' && t.toId === req.query.investmentId) && (!req.query.category || t.category === req.query.category) && (!req.query.search || `${t.notes} ${t.category} ${t.fromName ?? ''} ${t.toName ?? ''}`.toLowerCase().includes(String(req.query.search).toLowerCase())));
+    res.type('text/csv').attachment('pocket-transactions.csv').send(csv([['Date', 'Type', 'Amount', 'Category', 'Account', 'Notes', 'From', 'To', 'Received amount', 'Cost basis removed'], ...rows.map((t) => [t.date, t.type, t.amount, t.category, accounts.find((a) => a.id === t.accountId)?.name, t.notes, t.fromName, t.toName, t.receivedAmount, t.costBasisRemoved])]));
   });
 
   app.post('/api/smart-entry', async (req, res) => {
@@ -113,7 +119,35 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
     const save = write(async (req, tx) => {
       const old = req.params.id ? await tx.get(collection, req.params.id) : null;
       if (req.params.id && !old) fail('Record not found', 404);
+      if (collection === 'transactions' && old?.type === 'transfer') fail('Transfers are read-only. Record a separate correcting transfer instead.');
+      if (collection === 'transactions' && req.body.type === 'transfer') {
+        if (old) fail('Create a new transfer instead of converting an existing transaction');
+        const transfer = transferSchema.parse(req.body);
+        if (transfer.fromType === transfer.toType && transfer.fromId === transfer.toId) fail('Choose different source and destination');
+        if (transfer.fromType === 'investment' && transfer.toType !== 'account') fail('Investment transfers must go to an account');
+        const source = await tx.get(transfer.fromType === 'account' ? 'accounts' : 'investments', transfer.fromId);
+        const destination = await tx.get(transfer.toType === 'account' ? 'accounts' : 'investments', transfer.toId);
+        if (!source || !destination) fail('Choose an existing source and destination');
+        const holding = transfer.fromType === 'investment' ? source : transfer.toType === 'investment' ? destination : null;
+        if (holding && holding.type !== 'asset') fail('Only investment assets support transfers');
+        if (transfer.fromType === 'investment' && transfer.receivedAmount === undefined) fail('Enter the amount received in the bank');
+        if (transfer.fromType === 'account' && transfer.receivedAmount !== undefined && cents(transfer.receivedAmount) !== cents(transfer.amount)) fail('Account transfers must send and receive the same amount');
+        const record = { ...transfer, id: randomUUID(), receivedAmount: transfer.fromType === 'account' ? transfer.amount : transfer.receivedAmount, category: 'Transfer', fromName: source.name, toName: destination.name };
+        if (holding) {
+          const withdrawing = transfer.fromType === 'investment';
+          if (withdrawing && cents(transfer.amount) > cents(holding.value)) fail('Deducted amount exceeds the investment value');
+          // BigInt avoids precision loss when multiplying large minor-unit amounts.
+          const removed = withdrawing ? Number((2n * BigInt(cents(holding.cost)) * BigInt(cents(transfer.amount)) + BigInt(cents(holding.value))) / (2n * BigInt(cents(holding.value)))) : 0;
+          const value = money(cents(holding.value) + (withdrawing ? -1 : 1) * cents(transfer.amount));
+          const cost = money(cents(holding.cost) + (withdrawing ? -removed : cents(transfer.amount)));
+          if (value > 1_000_000_000 || cost > 1_000_000_000) fail('Investment value or cost exceeds the supported limit');
+          record.costBasisRemoved = money(removed);
+          await tx.put('investments', { ...holding, value, cost, date: transfer.date, history: [...(holding.history ?? []), { date: transfer.date, value, cost, transferId: record.id }] });
+        }
+        return { status: 201, body: await tx.put('transactions', record) };
+      }
       const body = schema.parse(req.body);
+      if (collection === 'investments' && old?.type !== body.type && (await tx.all('transactions')).some((t) => t.type === 'transfer' && (t.fromType === 'investment' && t.fromId === old?.id || t.toType === 'investment' && t.toId === old?.id))) fail('An investment with transfer history must remain an asset');
       if (collection === 'transactions' && !await tx.get('accounts', body.accountId)) fail('Choose an existing account');
       if (collection === 'categoryBudgets') {
         const names = await allCategories(tx);
@@ -131,7 +165,11 @@ export function createApp(store, { production = false, publicOrigin, trustProxy 
     app.post(`/api/${collection}`, save);
     app.put(`/api/${collection}/:id`, save);
     app.delete(`/api/${collection}/:id`, write(async (req, tx) => {
-      if (!await tx.get(collection, req.params.id)) fail('Record not found', 404);
+      const record = await tx.get(collection, req.params.id);
+      if (!record) fail('Record not found', 404);
+      if (collection === 'transactions' && record.type === 'transfer') fail('Transfers are read-only. Record a separate correcting transfer instead.');
+      const linkedType = collection === 'accounts' ? 'account' : collection === 'investments' ? 'investment' : null;
+      if (linkedType && (await tx.all('transactions')).some((t) => t.type === 'transfer' && (t.fromType === linkedType && t.fromId === record.id || t.toType === linkedType && t.toId === record.id))) fail('This record has transfer history and cannot be deleted');
       if (collection === 'accounts' && (await tx.all('transactions')).some((t) => t.accountId === req.params.id)) fail('Delete or reassign this account’s transactions first');
       await tx.delete(collection, req.params.id);
       return { body: { ok: true } };
